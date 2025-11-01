@@ -53,10 +53,12 @@ def fetch_data(ticker, days):
     try:
         df = yf.download(ticker.upper(), start=start, end=end,
                          interval=interval, progress=False, prepost=True, auto_adjust=True)
-        if df.empty:
+        if df is None or df.empty:
             return None, "無資料"
         df.index = pd.to_datetime(df.index).tz_localize(None)
         df = df.dropna()
+        if df.empty:
+            return None, "資料為空（已過濾）"
         return df, None
     except Exception as e:
         return None, f"下載錯誤：{e}"
@@ -72,35 +74,44 @@ def calculate_atr(df, period=14):
     return tr.rolling(window=period, min_periods=1).mean()
 
 # ========================================
-# 修正版 detect_swings（雙重保險）
+# 修正版 detect_swings（關鍵修復）
 # ========================================
 def detect_swings(df, distance, factor):
     prices = df['Close'].values.astype(np.float64)
     if len(prices) == 0:
         return np.array([], dtype=int), np.array([], dtype=int)
 
-    atr = calculate_atr(df)
+    # 計算 ATR
+    atr = calculate_atr(df)  # ← Series
     min_prom = df['Close'].std() * 0.05
-    prom_array = np.maximum(atr * factor, min_prom).values  # 強制 .values
+
+    # 強制轉成 numpy array
+    prom_array = (np.maximum(atr * factor, min_prom)).values  # 一定有 .values
 
     # 保險：長度對齊
     if len(prom_array) != len(prices):
-        prom_array = np.full(len(prices), prom_array.mean())
+        prom_array = np.full(len(prices), np.nanmean(prom_array))
 
+    # 嘗試使用動態 prominence
     try:
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=prom_array)
         troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=prom_array)
     except Exception as e:
         if debug:
-            st.warning(f"find_peaks 失敗：{e}")
-        const_prom = max(min_prom, atr.mean() * factor)
+            st.warning(f"find_peaks 失敗：{e}，改用常數 prominence")
+        # 降級：常數 prominence
+        const_prom = max(min_prom, np.nanmean(atr) * factor)
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=const_prom)
         troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=const_prom)
 
-    return np.array(peaks_idx, dtype=int), np.array(troughs_idx, dtype=int)
+    # 安全轉型
+    peaks_idx = np.array(peaks_idx, dtype=int) if len(peaks_idx) > 0 else np.array([], dtype=int)
+    troughs_idx = np.array(troughs_idx, dtype=int) if len(troughs_idx) > 0 else np.array([], dtype=int)
+
+    return peaks_idx, troughs_idx
 
 # ========================================
-# 安全擬合
+# 安全擬合線
 # ========================================
 def fit_line(df, idx_list):
     if not idx_list or len(idx_list) < 2:
@@ -111,8 +122,11 @@ def fit_line(df, idx_list):
         if np.any(np.isnan(y)):
             return None
         slope, intercept = np.polyfit(idx, y, 1)
-        return slope * np.arange(len(df)) + intercept
-    except:
+        x_all = np.arange(len(df))
+        return slope * x_all + intercept
+    except Exception as e:
+        if debug:
+            st.warning(f"擬合失敗：{e}")
         return None
 
 # ========================================
@@ -165,32 +179,46 @@ while True:
     with placeholder.container():
         df, error = fetch_data(ticker, lookback_days)
 
+        # 安全檢查
         if df is None or df.empty:
             st.error(f"無法取得資料：{error or '資料為空'}")
+            st.info("提示：\n"
+                    "- 確認股票代碼正確（含 .TW, .SS）\n"
+                    "- 交易時段：美股 09:30-16:00 ET\n"
+                    "- 網路正常")
             time.sleep(refresh_interval)
             continue
 
+        # 偵測 swing
         peaks_idx, troughs_idx = detect_swings(df, swing_distance, prominence_factor)
 
+        # 選取最近 N 個點
         chosen_peaks = peaks_idx[-num_swings:].tolist() if len(peaks_idx) >= num_swings else peaks_idx.tolist()
         chosen_troughs = troughs_idx[-num_swings:].tolist() if len(troughs_idx) >= num_swings else troughs_idx.tolist()
 
+        # 擬合線
         res_line = fit_line(df, chosen_peaks)
         sup_line = fit_line(df, chosen_troughs)
+
+        # Donchian
         dc_high, dc_low = donchian_channel(df, donchian_period)
 
+        # 繪圖
         fig = plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low)
         st.plotly_chart(fig, use_container_width=True)
 
+        # 資訊欄
         col1, col2, col3 = st.columns(3)
         with col1: st.metric("最新價", f"${df['Close'].iloc[-1]:.2f}")
         with col2: st.metric("High 點", len(peaks_idx))
         with col3: st.metric("Low 點", len(troughs_idx))
 
+        # 除錯
         if debug:
-            with st.expander("除錯"):
-                st.write("ATR shape:", calculate_atr(df).shape)
-                st.write("prom_array:", prom_array[:5] if 'prom_array' in locals() else "N/A")
+            with st.expander("除錯資訊"):
+                st.write("ATR 長度:", len(calculate_atr(df)))
+                st.write("prom_array 長度:", len(prom_array) if 'prom_array' in locals() else "N/A")
+                st.write("peaks_idx:", peaks_idx.tolist())
 
         st.caption(f"每 {refresh_interval}s 更新 | {datetime.now().strftime('%H:%M:%S')}")
 
