@@ -1,7 +1,8 @@
 """
-Streamlit App: 即時 5分鐘K線 + 動態支撐/阻力線 (已完全修復 find_peaks 錯誤)
-執行：
-    streamlit run app.py
+Streamlit App: 即時 5分鐘K線 + 動態支撐/阻力線
+已修復：
+1. ValueError: x must be a 1-D array
+2. The truth value of a Series is ambiguous
 """
 
 import streamlit as st
@@ -23,24 +24,24 @@ st.title("即時 5分鐘K線 + 動態支撐/阻力線")
 st.markdown("---")
 
 # ========================================
-# 側邊欄參數
+# 側邊欄
 # ========================================
 with st.sidebar:
     st.header("設定參數")
-    ticker = st.text_input("股票代碼", value="TSLA", help="例如：AAPL, NVDA, 0050.TW")
+    ticker = st.text_input("股票代碼", value="TSLA")
     lookback_days = st.slider("回看天數", 1, 30, 7)
     interval = "5m"
 
     st.markdown("### Swing 偵測")
-    swing_distance = st.slider("最小間距 (bars)", 1, 15, 5)
-    prominence_factor = st.slider("Prominence 係數 (ATR ×)", 0.1, 1.0, 0.3, step=0.05)
-    num_swings = st.slider("擬合線使用點數", 2, 8, 4)
+    swing_distance = st.slider("最小間距", 1, 15, 5)
+    prominence_factor = st.slider("Prominence 係數", 0.1, 1.0, 0.3, step=0.05)
+    num_swings = st.slider("擬合點數", 2, 8, 4)
 
-    st.markdown("### Donchian Channel")
-    donchian_period = st.slider("Donchian 週期", 10, 50, 20)
+    st.markdown("### Donchian")
+    donchian_period = st.slider("週期", 10, 50, 20)
 
-    refresh_interval = st.slider("自動刷新 (秒)", 30, 300, 60, step=30)
-    debug = st.checkbox("顯示除錯資訊", value=False)
+    refresh_interval = st.slider("刷新秒數", 30, 300, 60, step=30)
+    debug = st.checkbox("除錯模式", value=False)
 
 # ========================================
 # 快取資料
@@ -50,27 +51,18 @@ def fetch_data(ticker, days):
     end = datetime.utcnow()
     start = end - timedelta(days=days + 2)
     try:
-        df = yf.download(
-            ticker.upper(),
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval=interval,
-            progress=False,
-            prepost=True,
-            auto_adjust=True
-        )
+        df = yf.download(ticker.upper(), start=start, end=end,
+                         interval=interval, progress=False, prepost=True, auto_adjust=True)
         if df.empty:
-            return None, "無資料（可能非交易時段）"
+            return None, "無資料"
         df.index = pd.to_datetime(df.index).tz_localize(None)
         df = df.dropna()
-        if len(df) == 0:
-            return None, "資料為空（已過濾）"
         return df, None
     except Exception as e:
-        return None, f"下載失敗：{str(e)}"
+        return None, f"下載錯誤：{e}"
 
 # ========================================
-# 計算 ATR
+# ATR
 # ========================================
 def calculate_atr(df, period=14):
     high_low = df['High'] - df['Low']
@@ -80,69 +72,51 @@ def calculate_atr(df, period=14):
     return tr.rolling(window=period, min_periods=1).mean()
 
 # ========================================
-# 修正版 detect_swings（關鍵修復）
+# 修正版 detect_swings（雙重保險）
 # ========================================
 def detect_swings(df, distance, factor):
-    prices = df['Close'].values.astype(np.float64)  # 確保 1-D float64
+    prices = df['Close'].values.astype(np.float64)
     if len(prices) == 0:
         return np.array([], dtype=int), np.array([], dtype=int)
 
     atr = calculate_atr(df)
     min_prom = df['Close'].std() * 0.05
-    prominence = np.maximum(atr * factor, min_prom).values
+    prom_array = np.maximum(atr * factor, min_prom).values  # 強制 .values
 
-    # 確保 prominence 是 1-D array 且長度一致
-    if len(prominence) != len(prices):
-        # 若不一致（極少見），降級為常數
-        prominence = np.full_like(prices, fill_value=prominence.mean())
+    # 保險：長度對齊
+    if len(prom_array) != len(prices):
+        prom_array = np.full(len(prices), prom_array.mean())
 
-    # 正確傳入 prominence 參數
     try:
-        peaks_idx, _ = find_peaks(
-            prices,
-            distance=distance,
-            prominence=prominence
-        )
-        troughs_idx, _ = find_peaks(
-            -prices,
-            distance=distance,
-            prominence=prominence
-        )
+        peaks_idx, _ = find_peaks(prices, distance=distance, prominence=prom_array)
+        troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=prom_array)
     except Exception as e:
         if debug:
-            st.warning(f"find_peaks 失敗：{e}，改用常數 prominence")
-        # 降級：使用常數 prominence
+            st.warning(f"find_peaks 失敗：{e}")
         const_prom = max(min_prom, atr.mean() * factor)
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=const_prom)
         troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=const_prom)
 
-    # 安全轉為 int array
-    peaks_idx = np.array(peaks_idx, dtype=int) if len(peaks_idx) > 0 else np.array([], dtype=int)
-    troughs_idx = np.array(troughs_idx, dtype=int) if len(troughs_idx) > 0 else np.array([], dtype=int)
-
-    return peaks_idx, troughs_idx
+    return np.array(peaks_idx, dtype=int), np.array(troughs_idx, dtype=int)
 
 # ========================================
-# 安全擬合線
+# 安全擬合
 # ========================================
 def fit_line(df, idx_list):
-    if idx_list is None or len(idx_list) == 0:
+    if not idx_list or len(idx_list) < 2:
         return None
     try:
-        idx_array = np.array(idx_list, dtype=int)
-        if len(idx_array) < 2:
-            return None
-        y = df['Close'].iloc[idx_array].values
+        idx = np.array(idx_list, dtype=int)
+        y = df['Close'].iloc[idx].values
         if np.any(np.isnan(y)):
             return None
-        slope, intercept = np.polyfit(idx_array, y, 1)
-        x_all = np.arange(len(df))
-        return slope * x_all + intercept
+        slope, intercept = np.polyfit(idx, y, 1)
+        return slope * np.arange(len(df)) + intercept
     except:
         return None
 
 # ========================================
-# Donchian Channel
+# Donchian
 # ========================================
 def donchian_channel(df, period):
     high = df['High'].rolling(window=period, min_periods=1).max()
@@ -154,44 +128,32 @@ def donchian_channel(df, period):
 # ========================================
 def plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low):
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'],
-        low=df['Low'], close=df['Close'], name=ticker.upper()
-    ))
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+                                 low=df['Low'], close=df['Close'], name=ticker.upper()))
 
     if len(peaks_idx) > 0:
-        fig.add_trace(go.Scatter(
-            x=df.index[peaks_idx], y=df['High'].iloc[peaks_idx],
-            mode='markers', marker=dict(symbol='triangle-up', size=10, color='red'),
-            name='Swing High'
-        ))
+        fig.add_trace(go.Scatter(x=df.index[peaks_idx], y=df['High'].iloc[peaks_idx],
+                                 mode='markers', marker=dict(symbol='triangle-up', size=10, color='red'),
+                                 name='Swing High'))
     if len(troughs_idx) > 0:
-        fig.add_trace(go.Scatter(
-            x=df.index[troughs_idx], y=df['Low'].iloc[troughs_idx],
-            mode='markers', marker=dict(symbol='triangle-down', size=10, color='green'),
-            name='Swing Low'
-        ))
+        fig.add_trace(go.Scatter(x=df.index[troughs_idx], y=df['Low'].iloc[troughs_idx],
+                                 mode='markers', marker=dict(symbol='triangle-down', size=10, color='green'),
+                                 name='Swing Low'))
 
     if res_line is not None:
         fig.add_trace(go.Scatter(x=df.index, y=res_line, mode='lines',
-                                 line=dict(color='red', width=2, dash='dot'), name='動態阻力'))
+                                 line=dict(color='red', width=2, dash='dot'), name='阻力線'))
     if sup_line is not None:
         fig.add_trace(go.Scatter(x=df.index, y=sup_line, mode='lines',
-                                 line=dict(color='green', width=2, dash='dot'), name='動態支撐'))
+                                 line=dict(color='green', width=2, dash='dot'), name='支撐線'))
 
-    fig.add_trace(go.Scatter(x=df.index, y=dc_high, mode='lines',
-                             line=dict(color='gray', dash='dash'), name='Donchian High'))
-    fig.add_trace(go.Scatter(x=df.index, y=dc_low, mode='lines',
-                             line=dict(color='gray', dash='dash'), name='Donchian Low',
+    fig.add_trace(go.Scatter(x=df.index, y=dc_high, mode='lines', line=dict(color='gray', dash='dash'), name='Donchian High'))
+    fig.add_trace(go.Scatter(x=df.index, y=dc_low, mode='lines', line=dict(color='gray', dash='dash'), name='Donchian Low',
                              fill='tonexty', fillcolor='rgba(200,200,200,0.2)'))
 
-    fig.update_layout(
-        title=f"{ticker.upper()} 5分鐘K線 + 動態支撐/阻力",
-        xaxis_title="時間", yaxis_title="價格",
-        xaxis_rangeslider_visible=False, template="plotly_white",
-        hovermode="x unified", height=700,
-        margin=dict(l=40, r=40, t=80, b=40)
-    )
+    fig.update_layout(title=f"{ticker.upper()} 5分鐘K線", xaxis_title="時間", yaxis_title="價格",
+                      xaxis_rangeslider_visible=False, template="plotly_white",
+                      hovermode="x unified", height=700)
     return fig
 
 # ========================================
@@ -203,52 +165,34 @@ while True:
     with placeholder.container():
         df, error = fetch_data(ticker, lookback_days)
 
-        if error:
-            st.error(f"無法取得資料：{error}")
-            st.info("提示：\n"
-                    "- 確認股票代碼正確（含 .TW, .SS）\n"
-                    "- 交易時段：美股 09:30-16:00 ET\n"
-                    "- 網路正常")
+        if df is None or df.empty:
+            st.error(f"無法取得資料：{error or '資料為空'}")
             time.sleep(refresh_interval)
             continue
 
-        # 偵測 swing（已修復）
         peaks_idx, troughs_idx = detect_swings(df, swing_distance, prominence_factor)
 
-        # 選取最近 N 個點
         chosen_peaks = peaks_idx[-num_swings:].tolist() if len(peaks_idx) >= num_swings else peaks_idx.tolist()
         chosen_troughs = troughs_idx[-num_swings:].tolist() if len(troughs_idx) >= num_swings else troughs_idx.tolist()
 
-        # 擬合線
         res_line = fit_line(df, chosen_peaks)
         sup_line = fit_line(df, chosen_troughs)
-
-        # Donchian
         dc_high, dc_low = donchian_channel(df, donchian_period)
 
-        # 繪圖
         fig = plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low)
         st.plotly_chart(fig, use_container_width=True)
 
-        # 資訊欄
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("最新價格", f"${df['Close'].iloc[-1]:.2f}")
-        with col2:
-            st.metric("Swing High", len(peaks_idx))
-        with col3:
-            st.metric("Swing Low", len(troughs_idx))
-        with col4:
-            st.metric("資料筆數", len(df))
+        col1, col2, col3 = st.columns(3)
+        with col1: st.metric("最新價", f"${df['Close'].iloc[-1]:.2f}")
+        with col2: st.metric("High 點", len(peaks_idx))
+        with col3: st.metric("Low 點", len(troughs_idx))
 
-        # 除錯
         if debug:
-            with st.expander("除錯資訊"):
-                st.write("prices shape:", df['Close'].values.shape)
-                st.write("peaks_idx:", peaks_idx.tolist())
-                st.write("chosen_peaks:", chosen_peaks)
+            with st.expander("除錯"):
+                st.write("ATR shape:", calculate_atr(df).shape)
+                st.write("prom_array:", prom_array[:5] if 'prom_array' in locals() else "N/A")
 
-        st.caption(f"每 {refresh_interval} 秒更新 | 最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        st.caption(f"每 {refresh_interval}s 更新 | {datetime.now().strftime('%H:%M:%S')}")
 
     time.sleep(refresh_interval)
     st.rerun()
