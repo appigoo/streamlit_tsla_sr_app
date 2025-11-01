@@ -1,126 +1,215 @@
 """
-Streamlit app: TSLA 5-minute Dynamic Support / Resistance
-Fixed syntax issue on multiline markdown string.
+TSLA 5-minute Kline -> 自動計算並畫出動態支撐/阻力線 (Support / Resistance)
+Requirements:
+    pip install yfinance pandas numpy scipy plotly
+Run:
+    python tsla_support_resistance.py
 """
 
-import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import find_peaks
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import io
+import warnings
+warnings.filterwarnings("ignore")
 
-@st.cache_data(ttl=30)
-def fetch_5m_data(ticker: str, lookback_days: int) -> pd.DataFrame:
+# ---------------------------
+# Config（請依需求調整）
+# ---------------------------
+TICKER = "TSLA"
+INTERVAL = "5m"                    # 5-minute K-line
+LOOKBACK_DAYS = 7                  # 最近幾天資料
+SWING_DISTANCE = 5                 # 最小間距（根絕波動可調大）
+ATR_PERIOD = 14                    # 用於計算 prominence 的 ATR 週期
+PROMINENCE_FACTOR = 0.3            # prominence = ATR * factor（建議 0.2~0.5）
+NUM_SWINGS_FOR_LINE = 4            # 用最近幾個 swing points 擬合
+DONCHIAN_PERIOD = 20               # Donchian channel 週期
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def fetch_5m_data(ticker=TICKER, interval=INTERVAL, days=LOOKBACK_DAYS):
+    """取得 5 分鐘 K 線，處理時區與空資料"""
     end = datetime.utcnow()
-    start = end - timedelta(days=lookback_days)
-    df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
-                     interval="5m", progress=False, prepost=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.dropna()
-    if df.index.tz is not None:
-        df.index = pd.to_datetime(df.index).tz_convert(None)
-    else:
-        df.index = pd.to_datetime(df.index)
-    return df
+    start = end - timedelta(days=days)
+    try:
+        df = yf.download(
+            ticker,
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval=interval,
+            progress=False,
+            prepost=False,
+            auto_adjust=True
+        )
+        if df.empty:
+            raise ValueError("yfinance 回傳空資料框")
+        # 統一為 UTC naive
+        df.index = pd.to_datetime(df.index).tz_localize(None) if df.index.tz is not None else pd.to_datetime(df.index)
+        df = df.dropna()
+        return df
+    except Exception as e:
+        raise RuntimeError(f"無法取得資料：{e}\n"
+                           "請檢查：1) 網路連線 2) 是否在交易時段 3) Ticker 是否正確") from e
 
-def detect_swings(df: pd.DataFrame, col: str = 'Close', distance: int = 3, prominence: float = 0.5):
-    prices = df[col].values
-    if len(prices) < 3:
-        return np.array([], dtype=int), np.array([], dtype=int)
-    peaks_idx, _ = find_peaks(prices, distance=distance, prominence=prominence)
-    troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=prominence)
+
+def calculate_atr(df, period=ATR_PERIOD):
+    """計算 ATR（用於動態 prominence）"""
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift(1))
+    low_close = np.abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    return atr
+
+
+def detect_swings(df, distance=SWING_DISTANCE, prominence_factor=PROMINENCE_FACTOR):
+    """偵測 swing high / low，使用動態 prominence"""
+    prices = df['Close'].values
+    atr = calculate_atr(df)
+    prominence = atr * prominence_factor
+    # 為了避免 prominence 為 0，設定最小值
+    min_prom = df['Close'].std() * 0.05
+    prominence = np.maximum(prominence, min_prom)
+
+    # 偵測 peaks（阻力候選）
+    peaks_idx, _ = find_peaks(
+        prices,
+        distance=distance,
+        prominence=prominence
+    )
+    # 偵測 troughs（支撐候選）
+    troughs_idx, _ = find_peaks(
+        -prices,
+        distance=distance,
+        prominence=prominence
+    )
     return peaks_idx, troughs_idx
 
-def get_recent_n_indices(idx_array: np.ndarray, n: int):
-    if len(idx_array) == 0:
-        return []
-    return list(idx_array[-n:]) if len(idx_array) >= n else list(idx_array)
 
-def fit_line_through_points(df: pd.DataFrame, idx_list):
-    if not idx_list or len(idx_list) < 2:
+def fit_line_through_points(df, idx_list):
+    """
+    最小平方法擬合直線，使用「相對序數」作為 x，避免時間戳溢位
+    回傳 (slope, intercept, line_vals) 或 None
+    """
+    if len(idx_list) < 2:
         return None
-    x_points = np.array([df.index[i].astype('int64') / 1e9 for i in idx_list])
+    x_points = np.array(idx_list)                   # 相對序數 0,1,2,...
     y_points = df['Close'].values[idx_list]
     slope, intercept = np.polyfit(x_points, y_points, 1)
-    x_all = np.array([ts.astype('int64') / 1e9 for ts in df.index])
+    x_all = np.arange(len(df))
     line_vals = slope * x_all + intercept
     return slope, intercept, line_vals
 
-def donchian_channel(df: pd.DataFrame, period: int):
+
+def get_recent_n_indices(idx_array, n=NUM_SWINGS_FOR_LINE):
+    """取最近 n 個（不足則全部）"""
+    return list(idx_array[-n:]) if len(idx_array) >= n else list(idx_array)
+
+
+def donchian_channel(df, period=DONCHIAN_PERIOD):
     high = df['High'].rolling(window=period, min_periods=1).max()
     low = df['Low'].rolling(window=period, min_periods=1).min()
-    mid = (high + low) / 2.0
+    mid = (high + low) / 2
     return high, low, mid
 
-def build_figure(df: pd.DataFrame, peaks_idx, troughs_idx, res_line, sup_line, donchian_high, donchian_low, ticker: str):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index,
-                                 open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-                                 name=f"{ticker} 5m"))
-    if len(peaks_idx) > 0:
-        fig.add_trace(go.Scatter(x=df.index[peaks_idx], y=df['High'].values[peaks_idx],
-                                 mode='markers', marker=dict(symbol='triangle-up', size=9),
-                                 name='Swing Highs'))
-    if len(troughs_idx) > 0:
-        fig.add_trace(go.Scatter(x=df.index[troughs_idx], y=df['Low'].values[troughs_idx],
-                                 mode='markers', marker=dict(symbol='triangle-down', size=9),
-                                 name='Swing Lows'))
-    if res_line is not None:
-        _, _, line_vals = res_line
-        fig.add_trace(go.Scatter(x=df.index, y=line_vals, mode='lines', name='Fitted Resistance'))
-    if sup_line is not None:
-        _, _, line_vals = sup_line
-        fig.add_trace(go.Scatter(x=df.index, y=line_vals, mode='lines', name='Fitted Support'))
-    fig.add_trace(go.Scatter(x=df.index, y=donchian_high, mode='lines', name='Donchian High', line=dict(dash='dash')))
-    fig.add_trace(go.Scatter(x=df.index, y=donchian_low, mode='lines', name='Donchian Low', line=dict(dash='dash')))
-    fig.update_layout(title=f"{ticker} 5-minute Candlestick with Dynamic S/R",
-                      xaxis_rangeslider_visible=False,
-                      template='plotly_white',
-                      legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
-    return fig
 
-st.set_page_config(page_title='TSLA 5m Dynamic Support/Resistance', layout='wide')
-st.sidebar.title('Parameters')
-with st.sidebar.form('params'):
-    ticker = st.text_input('Ticker', 'TSLA').upper()
-    lookback_days = st.number_input('Lookback days', min_value=1, max_value=30, value=7)
-    distance = st.number_input('Swing distance (bars)', min_value=1, max_value=50, value=3)
-    prominence = st.number_input('Swing prominence', min_value=0.0, value=0.5, step=0.1)
-    num_swings = st.number_input('Num swings', min_value=2, max_value=20, value=4)
-    donchian_period = st.number_input('Donchian period', min_value=1, max_value=200, value=20)
-    download_html_name = st.text_input('Export HTML filename', 'tsla_5m_sr.html')
-    submitted = st.form_submit_button('Apply')
-
-col1, col2 = st.columns([1, 3])
-with col1:
-    refresh = st.button('Refresh / Fetch')
-with col2:
-    st.write('按「Refresh / Fetch」重新取得資料並更新圖表。')
-
-if submitted or refresh:
-    df = fetch_5m_data(ticker, int(lookback_days))
+# ---------------------------
+# Main processing
+# ---------------------------
+def build_chart(ticker=TICKER):
+    df = fetch_5m_data(ticker)
     if df.empty:
-        st.error('未取得資料，請檢查 ticker、網路或交易時段。')
-    else:
-        peaks_idx, troughs_idx = detect_swings(df, distance=int(distance), prominence=float(prominence))
-        chosen_peaks = get_recent_n_indices(peaks_idx, int(num_swings))
-        chosen_troughs = get_recent_n_indices(troughs_idx, int(num_swings))
-        res_line = fit_line_through_points(df, chosen_peaks)
-        sup_line = fit_line_through_points(df, chosen_troughs)
-        dc_high, dc_low, _ = donchian_channel(df, int(donchian_period))
-        fig = build_figure(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low, ticker)
-        st.plotly_chart(fig, use_container_width=True)
-        st.download_button('Download HTML', data=fig.to_html(), file_name=download_html_name)
-else:
-    st.info('設定參數後按 Apply，再按 Refresh / Fetch 取得最新 5 分鐘 K 線與支撐/阻力。')
+        raise RuntimeError("資料為空，無法繪圖。")
 
-st.markdown("""---
-**Tips:**
-- 調高 `prominence` 可減少噪音，但可能漏掉小幅 swing。
-- `distance` 為 bar 數，5m * 3 = 15 分鐘。
-- `num_swings` 小 → 線更貼近近期價格；大 → 線更平滑。
-""")
+    # 偵測 swing
+    peaks_idx, troughs_idx = detect_swings(df)
+
+    # 選取最近的 swing points
+    chosen_peak_idx = get_recent_n_indices(peaks_idx)
+    chosen_trough_idx = get_recent_n_indices(troughs_idx)
+
+    # 擬合支撐 / 阻力線
+    resistance_line = fit_line_through_points(df, chosen_peak_idx)
+    support_line = fit_line_through_points(df, chosen_trough_idx)
+
+    # Donchian Channel
+    dc_high, dc_low, dc_mid = donchian_channel(df)
+
+    # === 繪圖 ===
+    fig = go.Figure()
+
+    # K 線
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'], high=df['High'],
+        low=df['Low'], close=df['Close'],
+        name=f"{ticker} 5m"
+    ))
+
+    # Swing Highs / Lows
+    if len(peaks_idx) > 0:
+        fig.add_trace(go.Scatter(
+            x=df.index[peaks_idx], y=df['High'].values[peaks_idx],
+            mode='markers', marker=dict(symbol='triangle-up', size=9, color='red'),
+            name='Swing Highs'
+        ))
+    if len(troughs_idx) > 0:
+        fig.add_trace(go.Scatter(
+            x=df.index[troughs_idx], y=df['Low'].values[troughs_idx],
+            mode='markers', marker=dict(symbol='triangle-down', size=9, color='green'),
+            name='Swing Lows'
+        ))
+
+    # 擬合線
+    if resistance_line is not None:
+        _, _, line_vals = resistance_line
+        fig.add_trace(go.Scatter(x=df.index, y=line_vals, mode='lines',
+                                 line=dict(color='red', width=2, dash='dot'),
+                                 name='動態阻力線'))
+    if support_line is not None:
+        _, _, line_vals = support_line
+        fig.add_trace(go.Scatter(x=df.index, y=line_vals, mode='lines',
+                                 line=dict(color='green', width=2, dash='dot'),
+                                 name='動態支撐線'))
+
+    # Donchian Channel（填色）
+    fig.add_trace(go.Scatter(x=df.index, y=dc_high, mode='lines',
+                             line=dict(color='gray', dash='dash'),
+                             name=f'Donchian High ({DONCHIAN_PERIOD})'))
+    fig.add_trace(go.Scatter(x=df.index, y=dc_low, mode='lines',
+                             line=dict(color='gray', dash='dash'),
+                             name=f'Donchian Low ({DONCHIAN_PERIOD})',
+                             fill=None))
+    fig.add_trace(go.Scatter(x=df.index, y=dc_low, mode='lines',
+                             line=dict(color='rgba(0,0,0,0)'),
+                             fill='tonexty', fillcolor='rgba(200,200,200,0.2)',
+                             showlegend=False))
+
+    # 佈局
+    fig.update_layout(
+        title=f"{ticker} 5分鐘K線 + 動態支撐/阻力 (最近 {LOOKBACK_DAYS} 天)",
+        xaxis_title="時間",
+        yaxis_title="價格 (USD)",
+        xaxis_rangeslider_visible=False,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified"
+    )
+    return fig, df
+
+
+# ---------------------------
+# Run and show
+# ---------------------------
+if __name__ == "__main__":
+    try:
+        fig, df = build_chart(TICKER)
+        fig.show()
+        html_path = "tsla_5m_support_resistance.html"
+        fig.write_html(html_path)
+        print(f"圖表已儲存至：{html_path}")
+    except Exception as e:
+        print(f"程式執行失敗：{e}")
