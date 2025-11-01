@@ -1,9 +1,6 @@
 """
 Streamlit App: 即時 5分鐘K線 + 動態支撐/阻力線
-已修復所有錯誤：
-1. x must be 1-D array
-2. truth value of Series
-3. max() on Series
+已修復所有錯誤！
 """
 
 import streamlit as st
@@ -75,7 +72,7 @@ def calculate_atr(df, period=14):
     return tr.rolling(window=period, min_periods=1).mean()
 
 # ========================================
-# 最終版 detect_swings（三重保險）
+# 最終版 detect_swings（關鍵修復）
 # ========================================
 def detect_swings(df, distance, factor):
     prices = df['Close'].values.astype(np.float64)
@@ -85,12 +82,13 @@ def detect_swings(df, distance, factor):
     atr = calculate_atr(df)
     min_prom = df['Close'].std() * 0.05
 
-    # 強制 .values
-    prom_array = np.maximum(atr * factor, min_prom).values
+    # 關鍵：先取出 .values，再計算
+    prom_array = np.maximum(atr.values * factor, min_prom)
+    prom_array = np.asarray(prom_array, dtype=np.float64)
 
     # 長度對齊
     if len(prom_array) != len(prices):
-        prom_array = np.full(len(prices), np.nanmean(prom_array))
+        prom_array = np.full(len(prices), np.nanmean(prom_array), dtype=np.float64)
 
     try:
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=prom_array)
@@ -98,9 +96,8 @@ def detect_swings(df, distance, factor):
     except Exception as e:
         if debug:
             st.warning(f"find_peaks 失敗：{e}")
-        # 關鍵：atr.values → float
         atr_mean = np.nanmean(atr.values)
-        const_prom = max(min_prom, atr_mean * factor)
+        const_prom = float(max(min_prom, atr_mean * factor))
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=const_prom)
         troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=const_prom)
 
@@ -193,10 +190,6 @@ while True:
         with col1: st.metric("最新價", f"${df['Close'].iloc[-1]:.2f}")
         with col2: st.metric("High 點", len(peaks_idx))
         with col3: st.metric("Low 點", len(troughs_idx))
-
-        if debug:
-            with st.expander("除錯"):
-                st.write("ATR mean:", np.nanmean(calculate_atr(df).values))
 
         st.caption(f"每 {refresh_interval}s 更新 | {datetime.now().strftime('%H:%M:%S')}")
 
