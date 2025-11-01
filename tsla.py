@@ -1,5 +1,5 @@
 """
-Streamlit App: 即時 5分鐘K線 + 動態支撐/阻力線 (已修復所有錯誤)
+Streamlit App: 即時 5分鐘K線 + 動態支撐/阻力線 (已完全修復 find_peaks 錯誤)
 執行：
     streamlit run app.py
 """
@@ -18,12 +18,7 @@ warnings.filterwarnings("ignore")
 # ========================================
 # 頁面設定
 # ========================================
-st.set_page_config(
-    page_title="動態支撐阻力線",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
+st.set_page_config(page_title="動態支撐阻力線", layout="wide", initial_sidebar_state="expanded")
 st.title("即時 5分鐘K線 + 動態支撐/阻力線")
 st.markdown("---")
 
@@ -45,8 +40,6 @@ with st.sidebar:
     donchian_period = st.slider("Donchian 週期", 10, 50, 20)
 
     refresh_interval = st.slider("自動刷新 (秒)", 30, 300, 60, step=30)
-
-    st.markdown("### 除錯資訊")
     debug = st.checkbox("顯示除錯資訊", value=False)
 
 # ========================================
@@ -87,54 +80,65 @@ def calculate_atr(df, period=14):
     return tr.rolling(window=period, min_periods=1).mean()
 
 # ========================================
-# 偵測 Swing（安全回傳整數陣列）
+# 修正版 detect_swings（關鍵修復）
 # ========================================
 def detect_swings(df, distance, factor):
-    prices = df['Close'].values
+    prices = df['Close'].values.astype(np.float64)  # 確保 1-D float64
+    if len(prices) == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
     atr = calculate_atr(df)
-    prominence = np.maximum(atr * factor, df['Close'].std() * 0.05).values
+    min_prom = df['Close'].std() * 0.05
+    prominence = np.maximum(atr * factor, min_prom).values
 
-    peaks_idx, _ = find_peaks(prices, distance=distance, prominence=prominence)
-    troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=prominence)
+    # 確保 prominence 是 1-D array 且長度一致
+    if len(prominence) != len(prices):
+        # 若不一致（極少見），降級為常數
+        prominence = np.full_like(prices, fill_value=prominence.mean())
 
-    # 強制轉為 int ndarray
+    # 正確傳入 prominence 參數
+    try:
+        peaks_idx, _ = find_peaks(
+            prices,
+            distance=distance,
+            prominence=prominence
+        )
+        troughs_idx, _ = find_peaks(
+            -prices,
+            distance=distance,
+            prominence=prominence
+        )
+    except Exception as e:
+        if debug:
+            st.warning(f"find_peaks 失敗：{e}，改用常數 prominence")
+        # 降級：使用常數 prominence
+        const_prom = max(min_prom, atr.mean() * factor)
+        peaks_idx, _ = find_peaks(prices, distance=distance, prominence=const_prom)
+        troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=const_prom)
+
+    # 安全轉為 int array
     peaks_idx = np.array(peaks_idx, dtype=int) if len(peaks_idx) > 0 else np.array([], dtype=int)
     troughs_idx = np.array(troughs_idx, dtype=int) if len(troughs_idx) > 0 else np.array([], dtype=int)
 
     return peaks_idx, troughs_idx
 
 # ========================================
-# 安全擬合線（防呆版）
+# 安全擬合線
 # ========================================
 def fit_line(df, idx_list):
-    """
-    安全擬合：過濾空值、nan、不足點數
-    回傳 line_vals (array) 或 None
-    """
     if idx_list is None or len(idx_list) == 0:
         return None
-
-    # 轉為 numpy array 並清理
     try:
-        idx_array = np.array(idx_list, dtype=float)
-        idx_array = idx_array[~np.isnan(idx_array)]
-        idx_array = idx_array.astype(int)
-    except:
-        return None
-
-    if len(idx_array) < 2:
-        return None
-
-    try:
+        idx_array = np.array(idx_list, dtype=int)
+        if len(idx_array) < 2:
+            return None
         y = df['Close'].iloc[idx_array].values
-        if len(y) == 0 or np.any(np.isnan(y)):
+        if np.any(np.isnan(y)):
             return None
         slope, intercept = np.polyfit(idx_array, y, 1)
         x_all = np.arange(len(df))
         return slope * x_all + intercept
-    except Exception as e:
-        if debug:
-            st.warning(f"擬合失敗：{e}")
+    except:
         return None
 
 # ========================================
@@ -150,16 +154,11 @@ def donchian_channel(df, period):
 # ========================================
 def plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low):
     fig = go.Figure()
-
-    # K線
     fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['Open'], high=df['High'],
-        low=df['Low'], close=df['Close'],
-        name=ticker.upper()
+        x=df.index, open=df['Open'], high=df['High'],
+        low=df['Low'], close=df['Close'], name=ticker.upper()
     ))
 
-    # Swing 點
     if len(peaks_idx) > 0:
         fig.add_trace(go.Scatter(
             x=df.index[peaks_idx], y=df['High'].iloc[peaks_idx],
@@ -173,17 +172,13 @@ def plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low):
             name='Swing Low'
         ))
 
-    # 擬合線
     if res_line is not None:
         fig.add_trace(go.Scatter(x=df.index, y=res_line, mode='lines',
-                                 line=dict(color='red', width=2, dash='dot'),
-                                 name='動態阻力'))
+                                 line=dict(color='red', width=2, dash='dot'), name='動態阻力'))
     if sup_line is not None:
         fig.add_trace(go.Scatter(x=df.index, y=sup_line, mode='lines',
-                                 line=dict(color='green', width=2, dash='dot'),
-                                 name='動態支撐'))
+                                 line=dict(color='green', width=2, dash='dot'), name='動態支撐'))
 
-    # Donchian
     fig.add_trace(go.Scatter(x=df.index, y=dc_high, mode='lines',
                              line=dict(color='gray', dash='dash'), name='Donchian High'))
     fig.add_trace(go.Scatter(x=df.index, y=dc_low, mode='lines',
@@ -192,12 +187,9 @@ def plot_chart(df, peaks_idx, troughs_idx, res_line, sup_line, dc_high, dc_low):
 
     fig.update_layout(
         title=f"{ticker.upper()} 5分鐘K線 + 動態支撐/阻力",
-        xaxis_title="時間",
-        yaxis_title="價格",
-        xaxis_rangeslider_visible=False,
-        template="plotly_white",
-        hovermode="x unified",
-        height=700,
+        xaxis_title="時間", yaxis_title="價格",
+        xaxis_rangeslider_visible=False, template="plotly_white",
+        hovermode="x unified", height=700,
         margin=dict(l=40, r=40, t=80, b=40)
     )
     return fig
@@ -220,14 +212,14 @@ while True:
             time.sleep(refresh_interval)
             continue
 
-        # 偵測 swing
+        # 偵測 swing（已修復）
         peaks_idx, troughs_idx = detect_swings(df, swing_distance, prominence_factor)
 
         # 選取最近 N 個點
         chosen_peaks = peaks_idx[-num_swings:].tolist() if len(peaks_idx) >= num_swings else peaks_idx.tolist()
         chosen_troughs = troughs_idx[-num_swings:].tolist() if len(troughs_idx) >= num_swings else troughs_idx.tolist()
 
-        # 擬合線（安全）
+        # 擬合線
         res_line = fit_line(df, chosen_peaks)
         sup_line = fit_line(df, chosen_troughs)
 
@@ -249,16 +241,13 @@ while True:
         with col4:
             st.metric("資料筆數", len(df))
 
-        # 除錯資訊
+        # 除錯
         if debug:
             with st.expander("除錯資訊"):
+                st.write("prices shape:", df['Close'].values.shape)
                 st.write("peaks_idx:", peaks_idx.tolist())
-                st.write("troughs_idx:", troughs_idx.tolist())
                 st.write("chosen_peaks:", chosen_peaks)
-                st.write("chosen_troughs:", chosen_troughs)
-                st.write("res_line shape:", res_line.shape if res_line is not None else None)
 
-        # 刷新提示
         st.caption(f"每 {refresh_interval} 秒更新 | 最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     time.sleep(refresh_interval)
