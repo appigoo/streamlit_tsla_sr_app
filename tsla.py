@@ -82,8 +82,9 @@ def detect_swings(df, distance, factor):
     atr = calculate_atr(df)
     min_prom = df['Close'].std() * 0.05
 
-    # 關鍵：先取出 .values，再計算
-    prom_array = np.maximum(atr.values * factor, min_prom)
+    # 關鍵：先取出 .values，避免 Pandas broadcast 問題
+    atr_vals = atr.values
+    prom_array = np.maximum(atr_vals * factor, min_prom)
     prom_array = np.asarray(prom_array, dtype=np.float64)
 
     # 長度對齊
@@ -96,7 +97,7 @@ def detect_swings(df, distance, factor):
     except Exception as e:
         if debug:
             st.warning(f"find_peaks 失敗：{e}")
-        atr_mean = np.nanmean(atr.values)
+        atr_mean = np.nanmean(atr_vals)
         const_prom = float(max(min_prom, atr_mean * factor))
         peaks_idx, _ = find_peaks(prices, distance=distance, prominence=const_prom)
         troughs_idx, _ = find_peaks(-prices, distance=distance, prominence=const_prom)
